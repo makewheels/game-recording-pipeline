@@ -1,0 +1,13 @@
+{
+  "catalog": "~/Movies/视频列表.json",
+  "local_directory": "~/Movies/录屏待传",
+  "volume_uuid": "00000000-0000-0000-0000-000000000000",
+  "source_directory": "PS5/CREATE/Video Clips/你的游戏",
+  "baidu_directory": "录屏",
+  "bilibili_cookies": "~/.config/biliup/cookies.json",
+  "bilibili_partition": 17,
+  "bilibili_tags": "单机游戏,游戏实况",
+  "bilibili_line": "bda2",
+  "start_after": 3,
+  "delete_after_verification": false
+}

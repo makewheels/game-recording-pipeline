@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 .env
 cookies.json
+workflow.local.json
 视频列表.json
 *.webm
 *.mp4
