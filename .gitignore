@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+.DS_Store
+.env
+cookies.json
+视频列表.json
+*.webm
+*.mp4
+*.mkv
+*.mov
