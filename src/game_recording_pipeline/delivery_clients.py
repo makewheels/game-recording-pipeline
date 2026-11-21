@@ -4,6 +4,9 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import time
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
 class DeliveryError(RuntimeError):
@@ -156,3 +159,94 @@ class Bilibili:
         )
         if result.returncode or not output.is_file():
             raise DeliveryError("技术退回后的转码失败")
+
+
+class BilibiliCollection:
+    MEMBER = "https://member.bilibili.com"
+    PUBLIC = "https://api.bilibili.com"
+    USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+    def __init__(self, cookies, collection_id, section_id):
+        if any(type(value) is not int or value <= 0 for value in (collection_id, section_id)):
+            raise ValueError("B 站合集 ID 和小节 ID 必须是正整数")
+        self.cookies = cookies
+        self.collection_id = collection_id
+        self.section_id = section_id
+
+    def credentials(self):
+        try:
+            info = json.loads(self.cookies.read_text(encoding="utf-8"))
+            cookies = {c["name"]: c["value"] for c in info["cookie_info"]["cookies"]}
+            owner = int(cookies["DedeUserID"])
+            csrf = cookies["bili_jct"]
+            session = cookies["SESSDATA"]
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            raise DeliveryError("B 站合集操作需要有效的 biliup 登录信息") from exc
+        headers = {"Cookie": f"SESSDATA={session}; bili_jct={csrf}; DedeUserID={owner}",
+                   "Origin": self.MEMBER, "Referer": self.MEMBER + "/platform/upload-manager/season"}
+        return headers, csrf, owner
+
+    def request(self, origin, route, query, headers, payload=None):
+        headers = {"User-Agent": self.USER_AGENT} | headers
+        body = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            body = json.dumps(payload).encode("utf-8")
+        try:
+            request = Request(f"{origin}{route}?{urlencode(query)}", headers=headers, data=body)
+            with urlopen(request, timeout=20) as response:
+                result = json.load(response)
+        except (OSError, ValueError) as exc:
+            # 变更请求的 URL 含有 CSRF 令牌，错误里只保留状态码。
+            status = getattr(exc, "code", None) or type(exc).__name__
+            raise DeliveryError(f"B 站合集请求失败 {status}") from None
+        if not isinstance(result, dict):
+            raise DeliveryError("B 站合集未返回可读取的数据")
+        if result.get("code") != 0:
+            raise DeliveryError(f'B 站合集请求失败 {result.get("code")} {result.get("message", "")}')
+        return result.get("data")
+
+    def episodes(self, headers):
+        data = self.request(self.MEMBER, "/x2/creative/web/season/section", {"id": self.section_id}, headers)
+        section = data.get("section", {}) if isinstance(data, dict) else {}
+        if section.get("id") != self.section_id or section.get("seasonId") != self.collection_id:
+            raise DeliveryError("配置的 B 站小节与合集不匹配")
+        return sorted(data.get("episodes") or [], key=lambda episode: episode["order"])
+
+    def new_episode(self, bvid, owner):
+        data = self.request(self.PUBLIC, "/x/web-interface/view", {"bvid": bvid},
+                            {"Referer": "https://www.bilibili.com/"})
+        if not isinstance(data, dict) or data.get("bvid") != bvid or data.get("owner", {}).get("mid") != owner:
+            raise DeliveryError(f"B 站稿件与当前登录账号不匹配 {bvid}")
+        if data.get("season_id") or data.get("ugc_season"):
+            raise DeliveryError(f"B 站稿件已经位于某个合集小节 {bvid}")
+        if len(data.get("pages", [])) != 1:
+            raise DeliveryError(f"B 站合集自动添加需要单个分 P 的稿件 {bvid}")
+        return {key: data[key] for key in ("aid", "cid", "title")} | {"charging_pay": 0}
+
+    def ensure(self, bvids):
+        if not bvids:
+            return {}
+        if len(set(bvids)) != len(bvids) or not all(BV_PATTERN.fullmatch(bvid) for bvid in bvids):
+            raise ValueError("B 站合集列表里的 BV 号无效或有重复")
+        headers, csrf, owner = self.credentials()
+        existing = [e for e in self.episodes(headers) if e["bvid"] in bvids]
+        if [e["bvid"] for e in existing] != bvids[:len(existing)]:
+            raise DeliveryError("B 站合集的现有稿件顺序与清单不一致")
+        missing = bvids[len(existing):]
+        if missing:
+            episodes = [self.new_episode(bvid, owner) for bvid in missing]
+            self.request(self.MEMBER, "/x2/creative/web/season/section/episodes/add", {"csrf": csrf}, headers,
+                         {"sectionId": self.section_id, "episodes": episodes})
+            for attempt in range(4):
+                existing = [e for e in self.episodes(headers) if e["bvid"] in bvids]
+                if len(existing) >= len(bvids):
+                    break
+                if attempt < 3:
+                    time.sleep(2)
+        if [e["bvid"] for e in existing] != bvids:
+            raise DeliveryError("B 站合集未回显全部稿件或顺序不一致")
+        return {e["bvid"]: {"collection_id": self.collection_id, "section_id": self.section_id,
+                            "episode_id": e["id"]}
+                for e in existing}

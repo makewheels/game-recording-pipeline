@@ -8,6 +8,8 @@
   "bilibili_partition": 17,
   "bilibili_tags": "单机游戏,游戏实况",
   "bilibili_line": "bda2",
+  "bilibili_collection_id": null,
+  "bilibili_section_id": null,
   "start_after": 3,
   "delete_after_verification": false
 }

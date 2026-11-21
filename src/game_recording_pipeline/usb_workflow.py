@@ -18,7 +18,7 @@ import time
 import uuid
 
 from .classify_recording import FrameClassifier
-from .delivery_clients import Baidu, Bilibili, DeliveryError, TECHNICAL_REJECTION
+from .delivery_clients import Baidu, Bilibili, BilibiliCollection, DeliveryError, TECHNICAL_REJECTION
 from .publication_assets import clean_text, recording_text, render_cover
 from .recording_catalog import append_recording, catalog_lock, read_catalog, sha256, write_catalog
 
@@ -113,12 +113,18 @@ class Workflow:
             raise ValueError("start_after 必须大于或等于零")
         self.auto_delete = config.get("delete_after_verification") is True
         self.baidu = Baidu(work, str(remote))
+        cookies = Path(config["bilibili_cookies"]).expanduser().resolve()
         self.bilibili = Bilibili(
-            work, Path(config["bilibili_cookies"]).expanduser().resolve(),
+            work, cookies,
             int(config.get("bilibili_partition", 17)),
             config.get("bilibili_tags", "单机游戏,游戏实况"),
             config.get("bilibili_line"),
         )
+        collection_id = config.get("bilibili_collection_id")
+        section_id = config.get("bilibili_section_id")
+        self.collection = None
+        if collection_id is not None or section_id is not None:
+            self.collection = BilibiliCollection(cookies, collection_id, section_id)
 
     def sources(self, mount):
         folder = safe_path(mount, self.source_dir)
@@ -246,6 +252,34 @@ class Workflow:
         else:
             self.change(sequence, bilibili_error="暂未查到稿件回执，继续核对稿件列表")
 
+    def sync_collection(self, entries):
+        if self.collection is None:
+            return
+        pending = {}
+        for entry in entries:
+            receipt = entry.get("uploads", {}).get("bilibili", {})
+            if (receipt.get("collection_id"), receipt.get("section_id")) == (
+                self.collection.collection_id, self.collection.section_id
+            ):
+                continue
+            if receipt.get("status") != "published" or not receipt.get("bvid"):
+                break
+            pending[entry["sequence"]] = receipt["bvid"]
+        results = self.collection.ensure(list(pending.values()))
+        if not results:
+            return
+        with catalog_lock(self.path, write=True):
+            catalog = self.load()
+            for entry in catalog["videos"]:
+                bvid = pending.get(entry["sequence"])
+                if bvid is None:
+                    continue
+                receipt = entry["uploads"]["bilibili"]
+                if receipt["bvid"] != bvid:
+                    raise DeliveryError("清单中的 BV 号已变化")
+                receipt.update(results[bvid])
+            write_catalog(self.path, catalog)
+
     def drain(self):
         succeeded = True
         for service, method in (("bilibili", self.publish_one), ("baidu", self.backup_one)):
@@ -258,6 +292,7 @@ class Workflow:
                     print(f'{entry["sequence"]:03d} {service} {message}', flush=True)
                     succeeded = False
                     break
+        self.sync_collection(self.active())
         return succeeded
 
     def finish(self):
@@ -268,6 +303,10 @@ class Workflow:
             archive = entry.get("uploads", {}).get("bilibili", {})
             backup = entry.get("uploads", {}).get("baidu", {})
             if archive.get("status") != "published" or not backup_verified(backup):
+                return
+            if self.collection and (archive.get("collection_id"), archive.get("section_id")) != (
+                self.collection.collection_id, self.collection.section_id
+            ):
                 return
             if self.bilibili.review(archive["bvid"])[0] != "published":
                 return
