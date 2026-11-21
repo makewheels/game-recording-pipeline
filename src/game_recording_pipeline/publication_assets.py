@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 import re
 import subprocess
@@ -21,21 +22,35 @@ def clean_text(text):
     return " ".join(re.sub(r"[|｜]", " ", text).split())
 
 
-def publication_text(sequence, mission, action):
-    mission, action = clean_text(mission), clean_text(action)
-    heading = MISSION_LABELS.get(mission, mission)
-    title = f"第{sequence:03d}集 {heading}"
+def clip_text(clip):
+    mission, _, action = clip.partition("_")
+    mission, action = clean_text(mission), clean_text(action.replace("_", " "))
+    if not mission:
+        mission, action = action, ""
+    if not mission:
+        raise ValueError("需要任务名或片段内容")
+    heading = mission
     if mission in MISSION_LABELS:
-        title += f"（{mission}）"
-    if action and action != heading:
-        title += f" {action}"
-    return title[:80], heading, "" if action == heading else action
+        heading = MISSION_LABELS[mission]
+        mission = f"{heading}（{mission}）"
+    else:
+        chinese, _, english = mission.partition("（")
+        if english.endswith("）") and MISSION_LABELS.get(english[:-1]) == chinese:
+            heading = chinese
+    action = "" if action == heading else action
+    return f"{mission}_{action}" if action else mission, heading, action
+
+
+def recording_stem(recorded_at, sequence, clip):
+    label, _, _ = clip_text(clip)
+    return f"{recorded_at:%Y%m%d}_{sequence:03d}_{label}"[:80].rstrip("_ ")
 
 
 def recording_text(entry):
     clip = Path(entry["filename"]).stem.split("_", 2)[2]
-    mission, _, action = clip.partition("_")
-    return publication_text(entry["sequence"], mission, action.replace("_", " "))
+    _, heading, action = clip_text(clip)
+    title = recording_stem(datetime.fromisoformat(entry["recorded_at"]), entry["sequence"], clip)
+    return title, heading, action
 
 
 def text_width(text):

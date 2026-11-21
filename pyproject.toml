@@ -1,0 +1,20 @@
+[project]
+name = "game-recording-pipeline"
+version = "0.1.0"
+description = "Import, identify, rename, upload, and archive game recordings."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/makewheels/game-recording-pipeline"
+
+[project.scripts]
+game-recording-catalog = "game_recording_pipeline.recording_catalog:main"
+game-recording-usb = "game_recording_pipeline.usb_workflow:main"
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"

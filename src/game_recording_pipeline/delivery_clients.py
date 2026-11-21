@@ -100,14 +100,14 @@ class Bilibili:
         self.tags = tags
         self.line = line
 
-    def find(self, title):
+    def find(self, title, *, exclude=None):
         result = execute([*self.prefix, "list", "-m", "3"], self.work, 90)
         if result.returncode:
             raise DeliveryError("哔哩哔哩稿件列表获取失败")
         matches = []
         for line in ANSI_PATTERN.sub("", result.stdout).splitlines():
             fields = line.split("\t")
-            if len(fields) >= 2 and fields[1] == title and BV_PATTERN.fullmatch(fields[0]):
+            if len(fields) >= 2 and fields[1] == title and fields[0] != exclude and BV_PATTERN.fullmatch(fields[0]):
                 matches.append(fields[0])
         if len(matches) > 1:
             raise DeliveryError("哔哩哔哩存在同名稿件，请核对 BV 号")
@@ -126,7 +126,7 @@ class Bilibili:
             return "rejected", reason
         return "reviewing", reason
 
-    def submit(self, video, title, description, *, cover):
+    def submit(self, video, title, description, *, cover, exclude=None):
         arguments = [*self.prefix, "upload", "--submit", "web", "--tid", str(self.partition),
                      "--tag", self.tags, "--title", title, "--desc", description, "--cover", str(cover)]
         if self.line:
@@ -135,8 +135,8 @@ class Bilibili:
         output = result.stdout + "\n" + result.stderr
         if result.returncode == 0:
             match = BV_PATTERN.search(output)
-            return match.group(0) if match else self.find(title)
-        existing = self.find(title)
+            return match.group(0) if match and match.group(0) != exclude else self.find(title, exclude=exclude)
+        existing = self.find(title, exclude=exclude)
         if existing:
             return existing
         if "All files uploaded successfully" not in output and (

@@ -12,6 +12,8 @@ import re
 import sys
 import tempfile
 
+from .publication_assets import recording_stem
+
 
 @contextmanager
 def catalog_lock(path, *, write):
@@ -78,7 +80,7 @@ def append_recording(path, catalog, source, original_filename, recorded_at, titl
     if not title.strip() or re.search(r"[:/\\\x00-\x1f]", title):
         raise ValueError("任务标题为空或含有文件名不能使用的字符")
     sequence = catalog["last_sequence"] + 1
-    name = f"{recorded_at:%Y%m%d-%H%M%S}_{sequence:03d}_{title.strip()}{source.suffix}"
+    name = recording_stem(recorded_at, sequence, title) + source.suffix
     destination = (directory or path.parent) / name
     before = source.stat()
     digest = sha256(source)

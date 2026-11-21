@@ -17,16 +17,16 @@ import tempfile
 import time
 import uuid
 
-from classify_recording import FrameClassifier
-from delivery_clients import Baidu, Bilibili, DeliveryError, TECHNICAL_REJECTION
-from publication_assets import clean_text, recording_text, render_cover
-from recording_catalog import append_recording, catalog_lock, read_catalog, sha256, write_catalog
+from .classify_recording import FrameClassifier
+from .delivery_clients import Baidu, Bilibili, DeliveryError, TECHNICAL_REJECTION
+from .publication_assets import clean_text, recording_text, render_cover
+from .recording_catalog import append_recording, catalog_lock, read_catalog, sha256, write_catalog
 
 
 FORMATS = {".webm", ".mp4", ".mkv", ".mov", ".m4v"}
 DISKUTIL = "/usr/sbin/diskutil"
 LAUNCHCTL = "/bin/launchctl"
-AGENT_NAME = "local.recording-catalog.usb-workflow"
+AGENT_NAME = "local.game-recording-pipeline.usb"
 
 
 def attached_disk(volume_uuid):
@@ -200,9 +200,10 @@ class Workflow:
         uploads = entry.get("uploads", {})
         receipt = uploads.get("bilibili", {})
         publication = entry.get("publication", {})
+        rejected_bvid = entry.get("rejected_bilibili", {}).get("bvid")
         default_title, heading, action = recording_text(entry)
         title = receipt.get("title") or publication.get("title") or default_title
-        bvid = receipt.get("bvid") or self.bilibili.find(title)
+        bvid = receipt.get("bvid") or self.bilibili.find(title, exclude=rejected_bvid)
         if bvid:
             status, reason = self.bilibili.review(bvid)
             receipt = receipt | {"bvid": bvid, "title": title, "status": status}
@@ -213,8 +214,7 @@ class Workflow:
                 or any(word in reason for word in ("版权", "违规", "血腥", "隐私"))
             ):
                 return
-            retry_title = clean_text(title)[:72] + "（重传）"
-            self.change(sequence, publication={"title": retry_title, "repaired": True, "started": False},
+            self.change(sequence, publication={"title": default_title, "repaired": True, "started": False},
                         uploads={key: value for key, value in uploads.items() if key != "bilibili"},
                         rejected_bilibili=receipt | {"reason": reason})
             return
@@ -230,11 +230,12 @@ class Workflow:
             cover = Path(temporary) / "封面.jpg"
             render_cover(video, cover, sequence, heading, action)
             if repaired:
-                submission = Path(temporary) / "录屏.mp4"
+                submission = Path(temporary) / f"{video.stem}.mp4"
                 self.bilibili.transcode(video, submission)
             self.change(sequence, publication=state)
             try:
-                bvid = self.bilibili.submit(submission, title, f"{title}。游戏实况录屏。", cover=cover)
+                bvid = self.bilibili.submit(submission, title, f"{title}。游戏实况录屏。",
+                                             cover=cover, exclude=rejected_bvid)
             except DeliveryError as error:
                 if "文件传输失败，可重试" in str(error):
                     self.change(sequence, publication=state | {"started": False})
@@ -322,7 +323,7 @@ def install_agent(config_path, workflow):
     folder = Path.home() / "Library" / "LaunchAgents"
     folder.mkdir(parents=True, exist_ok=True)
     destination = folder / f"{AGENT_NAME}.plist"
-    program = [sys.executable, "-B", str(Path(__file__).resolve()),
+    program = [sys.executable, "-B", "-m", "game_recording_pipeline.usb_workflow",
                "--config", str(config_path), "--watch"]
     settings = {
         "Label": AGENT_NAME,
