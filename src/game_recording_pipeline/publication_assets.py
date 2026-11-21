@@ -20,6 +20,7 @@ NUMBER_FONT = "/System/Library/Fonts/Supplemental/DIN Alternate Bold.ttf"
 DARK = "#100d18"
 COVER_WIDTH = 1280
 COVER_HEIGHT = 800
+COVER_DIRECTORY = "B站封面"
 
 
 def clean_text(text):
@@ -28,19 +29,18 @@ def clean_text(text):
 
 def clip_text(clip):
     mission, _, action = clip.partition("_")
-    mission, action = clean_text(mission), clean_text(action.replace("_", " "))
+    mission = clean_text(re.sub(r"[()（）]", " ", mission))
+    action = clean_text(re.sub(r"[()（）_]", " ", action))
     if not mission:
         mission, action = action, ""
     if not mission:
         raise ValueError("需要任务名或片段内容")
     heading = mission
-    if mission in MISSION_LABELS:
-        heading = MISSION_LABELS[mission]
-        mission = f"{heading}（{mission}）"
-    else:
-        chinese, _, english = mission.partition("（")
-        if english.endswith("）") and MISSION_LABELS.get(english[:-1]) == chinese:
-            heading = chinese
+    for english, chinese in MISSION_LABELS.items():
+        bilingual = f"{chinese} {english}"
+        if mission in (english, bilingual):
+            mission, heading = bilingual, chinese
+            break
     action = "" if action == heading else action
     return f"{mission}_{action}" if action else mission, heading, action
 
@@ -61,13 +61,11 @@ def text_width(text):
     return sum(1 if east_asian_width(char) in ("F", "W") else 0.60 for char in text)
 
 
-def cover_line(sequence, heading):
+def cover_heading(heading):
     heading = clean_text(heading) or "游戏实况"
-    number = f"{sequence:03d}"
-    prefix_width = len(number) * 0.49 + 0.33
-    line_width = 1030
+    line_width = 1000
     minimum = 94
-    available = line_width / minimum - prefix_width
+    available = line_width / minimum
     if text_width(heading) > available:
         label = ""
         for char in heading:
@@ -75,8 +73,7 @@ def cover_line(sequence, heading):
                 break
             label += char
         heading = label.rstrip() + "…"
-    size = min(144, round(line_width / (prefix_width + text_width(heading))))
-    return number, heading, size, round(prefix_width * size)
+    return heading, min(156, round(line_width / text_width(heading)))
 
 
 def outline_text(text, font, color, size, position):
@@ -102,9 +99,8 @@ def render_cover(video, output, sequence, heading, *, at=None):
 
 
 def render_cover_frame(frame, output, sequence, heading):
-    number, label, size, offset = cover_line(sequence, heading)
+    label, size = cover_heading(heading)
     canvas = f"{COVER_WIDTH}x{COVER_HEIGHT}"
-    x, baseline = 116, 630
     subprocess.run(
         ["magick", "jpeg:-", "-colorspace", "sRGB", "-resize", f"{canvas}^",
          "-gravity", "Center", "-extent", canvas, "-modulate", "106,110,100",
@@ -112,8 +108,8 @@ def render_cover_frame(frame, output, sequence, heading):
          "-gravity", "South", "-background", "none", "-extent", canvas, ")",
          "-compose", "Over", "-composite",
          "-gravity", "Forget",
-         *outline_text(number, NUMBER_FONT, "#f6d89a", size, f"+{x}+{baseline}"),
-         *outline_text(label, FONT, "#ffffff", size, f"+{x+offset}+{baseline}"),
+         *outline_text(f"{sequence:03d}", NUMBER_FONT, "#f6d89a", 110, "+140+482"),
+         *outline_text(label, FONT, "#ffffff", size, "+140+650"),
          "-sampling-factor", "4:4:4", "-quality", "91", "-strip", f"jpg:{output}"],
         input=frame, check=True, capture_output=True, timeout=60,
     )

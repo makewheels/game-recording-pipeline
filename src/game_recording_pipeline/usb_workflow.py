@@ -19,8 +19,8 @@ import uuid
 
 from .classify_recording import FrameClassifier
 from .delivery_clients import Baidu, Bilibili, BilibiliCollection, DeliveryError, TECHNICAL_REJECTION
-from .publication_assets import clean_text, recording_text, render_cover
-from .recording_catalog import append_recording, catalog_lock, read_catalog, sha256, write_catalog
+from .publication_assets import COVER_DIRECTORY, clean_text, recording_text, render_cover
+from .recording_catalog import append_recording, catalog_lock, read_catalog, rename_without_replacing, sha256, write_catalog
 
 
 FORMATS = {".webm", ".mp4", ".mkv", ".mov", ".m4v"}
@@ -113,6 +113,7 @@ class Workflow:
             raise ValueError("start_after 必须大于或等于零")
         self.auto_delete = config.get("delete_after_verification") is True
         self.baidu = Baidu(work, str(remote))
+        self.baidu_covers = Baidu(work, str(remote / COVER_DIRECTORY))
         cookies = Path(config["bilibili_cookies"]).expanduser().resolve()
         self.bilibili = Bilibili(
             work, cookies,
@@ -193,13 +194,45 @@ class Workflow:
                 and not item.get("cleanup", {}).get("completed")
             ]
 
+    def cover_asset(self, entry, video=None):
+        publication = entry.get("publication", {})
+        default = Path(COVER_DIRECTORY) / Path(entry["filename"]).with_suffix(".jpg").name
+        relative = Path(publication.get("cover_file", default))
+        if relative.parent != Path(COVER_DIRECTORY) or relative.suffix != ".jpg":
+            raise DeliveryError("清单中的封面路径不在 B 站封面目录中")
+        cover = self.path.parent / relative
+        if cover.is_symlink() or cover.parent.is_symlink():
+            raise DeliveryError("封面或封面目录不能是符号链接")
+        if not cover.exists():
+            if video is None:
+                video = checked_local(self.video_directory(entry), entry)
+            _, heading, _ = recording_text(entry)
+            with tempfile.TemporaryDirectory(prefix="cover-", dir=self.work) as temporary:
+                staging = Path(temporary) / "封面.jpg"
+                render_cover(video, staging, entry["sequence"], heading,
+                             at=publication.get("cover_frame_seconds"))
+                cover.parent.mkdir(exist_ok=True)
+                rename_without_replacing(staging, cover)
+        checksum = sha256(cover)
+        if publication.get("cover_sha256", checksum) != checksum:
+            raise DeliveryError(f"本地封面 SHA-256 不一致 {cover.name}")
+        return cover, publication | {"cover_file": str(relative), "cover_sha256": checksum}
+
     def backup_one(self, entry):
         uploads = entry.get("uploads", {})
-        if backup_verified(uploads.get("baidu", {})):
+        sequence = entry["sequence"]
+        video = None
+        if not backup_verified(uploads.get("baidu", {})):
+            video = checked_local(self.video_directory(entry), entry)
+            uploads = uploads | {"baidu": self.baidu.upload(video, entry)}
+            self.change(sequence, uploads=uploads)
+        if backup_verified(uploads.get("baidu_cover", {})):
             return
-        video = checked_local(self.video_directory(entry), entry)
-        receipt = self.baidu.upload(video, entry)
-        self.change(entry["sequence"], uploads=uploads | {"baidu": receipt}, baidu_error="")
+        cover, publication = self.cover_asset(entry, video)
+        receipt = self.baidu_covers.upload(cover, {
+            "size_bytes": cover.stat().st_size, "sha256": publication["cover_sha256"],
+        })
+        self.change(sequence, publication=publication, uploads=uploads | {"baidu_cover": receipt}, baidu_error="")
 
     def publish_one(self, entry):
         sequence = entry["sequence"]
@@ -207,7 +240,7 @@ class Workflow:
         receipt = uploads.get("bilibili", {})
         publication = entry.get("publication", {})
         rejected_bvid = entry.get("rejected_bilibili", {}).get("bvid")
-        default_title, heading, _ = recording_text(entry)
+        default_title, _, _ = recording_text(entry)
         title = receipt.get("title") or publication.get("title") or default_title
         bvid = receipt.get("bvid") or self.bilibili.find(title, exclude=rejected_bvid)
         if bvid:
@@ -220,7 +253,7 @@ class Workflow:
                 or any(word in reason for word in ("版权", "违规", "血腥", "隐私"))
             ):
                 return
-            self.change(sequence, publication={"title": default_title, "repaired": True, "started": False},
+            self.change(sequence, publication=publication | {"title": default_title, "repaired": True, "started": False},
                         uploads={key: value for key, value in uploads.items() if key != "bilibili"},
                         rejected_bilibili=receipt | {"reason": reason})
             return
@@ -230,11 +263,10 @@ class Workflow:
         title = clean_text(title)
         video = checked_local(self.video_directory(entry), entry)
         repaired = publication.get("repaired", False)
-        state = {"title": title, "repaired": repaired, "started": True}
+        cover, publication = self.cover_asset(entry, video)
+        state = publication | {"title": title, "repaired": repaired, "started": True}
         with tempfile.TemporaryDirectory(prefix="submission-", dir=self.work) as temporary:
             submission = video
-            cover = Path(temporary) / "封面.jpg"
-            render_cover(video, cover, sequence, heading)
             if repaired:
                 submission = Path(temporary) / f"{video.stem}.mp4"
                 self.bilibili.transcode(video, submission)
@@ -302,7 +334,8 @@ class Workflow:
         for entry in entries:
             archive = entry.get("uploads", {}).get("bilibili", {})
             backup = entry.get("uploads", {}).get("baidu", {})
-            if archive.get("status") != "published" or not backup_verified(backup):
+            cover = entry.get("uploads", {}).get("baidu_cover", {})
+            if archive.get("status") != "published" or not backup_verified(backup) or not backup_verified(cover):
                 return
             if self.collection and (archive.get("collection_id"), archive.get("section_id")) != (
                 self.collection.collection_id, self.collection.section_id
@@ -311,6 +344,8 @@ class Workflow:
             if self.bilibili.review(archive["bvid"])[0] != "published":
                 return
             if not self.baidu.confirmed(entry["filename"], backup):
+                return
+            if not self.baidu_covers.confirmed(Path(entry["publication"]["cover_file"]).name, cover):
                 return
 
         pending = [entry for entry in entries if not entry.get("cleanup", {}).get("usb_ejected")]

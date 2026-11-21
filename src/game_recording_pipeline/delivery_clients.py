@@ -36,12 +36,15 @@ class Baidu:
         return decode_json(execute(command, self.work, timeout).stdout)
 
     def lookup(self, target, *, directory=False):
-        data = self.request("ls", target, timeout=60)
+        arguments = ("ls", target, "--folder") if directory else ("ls", target)
+        data = self.request(*arguments, timeout=60)
         expected = f"/apps/bdpan/{target}"
         if isinstance(data, list):
             matches = [item for item in data if item["path"] == expected and item["isdir"] == directory]
             if len(matches) == 1:
                 return matches[0]
+            if not matches:
+                return None
         if isinstance(data, dict) and re.search(r"错误码 -9[)），]|^.*\(-9\)", str(data.get("error", ""))):
             return None
         raise DeliveryError(f"百度网盘目录或文件查询失败 {target}")
