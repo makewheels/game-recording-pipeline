@@ -12,7 +12,9 @@ MISSION_LABELS = {
     "Unwanted Attention": "惹上麻烦",
 }
 
-FONT = "/System/Library/Fonts/STHeiti Medium.ttc"
+FONT = "/System/Library/Fonts/Hiragino Sans GB.ttc"
+DARK = "#100d18"
+YELLOW = "#ffe35a"
 
 
 def clean_text(text):
@@ -36,12 +38,28 @@ def recording_text(entry):
     return publication_text(entry["sequence"], mission, action.replace("_", " "))
 
 
-def point_size(text, maximum):
-    width = sum(1 if east_asian_width(char) in ("F", "W") else 0.58 for char in text)
-    return str(min(maximum, round(705 / max(width, 1))))
+def text_width(text):
+    return sum(1 if east_asian_width(char) in ("F", "W") else 0.60 for char in text)
 
 
-def render_cover(video, output, sequence, heading, action, *, at=None, series="游戏实况"):
+def heading_lines(heading):
+    if text_width(heading) <= 11:
+        return [heading]
+    midpoint = len(heading) // 2
+    boundary = min((i for i, char in enumerate(heading) if char == " "),
+                   key=lambda i: abs(i - midpoint), default=midpoint)
+    if abs(boundary - midpoint) > len(heading) // 4:
+        boundary = midpoint
+    return [heading[:boundary].rstrip(), heading[boundary:].lstrip()]
+
+
+def outline_text(text, color, size, position):
+    return ["-pointsize", str(size), "-fill", color, "-stroke", DARK, "-strokewidth", "14",
+            "-annotate", position, text,
+            "-stroke", color, "-strokewidth", "5", "-annotate", position, text]
+
+
+def render_cover(video, output, sequence, heading, action, *, at=None):
     if at is None:
         duration = subprocess.check_output(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video],
@@ -54,18 +72,26 @@ def render_cover(video, output, sequence, heading, action, *, at=None, series="�
          "-f", "image2pipe", "-c:v", "mjpeg", "-threads", "1", "-"],
         timeout=60,
     )
+    badge = f"第{sequence:03d}集"
+    badge_size = min(110, round(520 / text_width(badge)))
+    badge_right = 184 + round(badge_size * text_width(badge))
+    lines = heading_lines(heading)
+    title_size = min(164 if len(lines) == 1 else 124,
+                     round(1040 / max(max(map(text_width, lines)), 1)))
+    text = []
+    for index, line in enumerate(lines):
+        y = (315 if len(lines) == 1 else 267) + index * (title_size + 13)
+        text.extend(outline_text(f" {line}", "#ffffff", title_size, f"+117+{y}"))
+    if action:
+        action_size = min(93, round(1020 / text_width(action)))
+        text.extend(outline_text(f" {action}", "#fff29a", action_size, "+117+545"))
     subprocess.run(
-        ["magick", "jpeg:-", "-colorspace", "sRGB", "-modulate", "110,110,100",
-         "(", "-size", "800x910", "gradient:#0d0915ed-#0d091500", "-rotate", "-90",
-          "-gravity", "West", "-background", "none", "-extent", "1280x800", ")",
+        ["magick", "jpeg:-", "-colorspace", "sRGB", "-modulate", "108,114,100",
+         "(", "-size", "800x1280", "gradient:#100d18de-#100d1800", "-rotate", "-90", ")",
          "-compose", "Over", "-composite",
-         "-fill", "#ffba8d", "-draw", "rectangle 85,286 154,293",
-         "-font", FONT, "-gravity", "NorthWest",
-         "-pointsize", "32", "-annotate", "+85+313", f"{series}   第{sequence:03d}集",
-         "-pointsize", point_size(heading, 104), "-fill", "#fff8f1",
-         "-stroke", "#fff8f1", "-strokewidth", "1.8", "-annotate", "+84+376", f" {heading}",
-         "-stroke", "none", "-pointsize", point_size(action, 48), "-fill", "#fff1dc",
-         "-annotate", "+85+515", f" {action}",
-         "-sampling-factor", "4:4:4", "-quality", "91", "-strip", f"jpg:{output}"],
+         "-fill", YELLOW, "-stroke", "none", "-draw", f"roundrectangle 115,111 {badge_right},250 21,21",
+         "-font", FONT, "-gravity", "NorthWest", "-pointsize", str(badge_size),
+         "-fill", DARK, "-stroke", DARK, "-strokewidth", "4.8", "-annotate", "+135+122", badge,
+         *text, "-sampling-factor", "4:4:4", "-quality", "91", "-strip", f"jpg:{output}"],
         input=frame, check=True, capture_output=True, timeout=60,
     )
