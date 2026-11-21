@@ -6,6 +6,8 @@ from unicodedata import east_asian_width
 
 
 MISSION_LABELS = {
+    "Prologue": "序章",
+    "Gone Fishing": "出海钓鱼",
     "Lab Fees": "替布莱恩收租",
     "Gear Up": "置办武器",
     "Pipework": "水管活儿",
@@ -14,8 +16,10 @@ MISSION_LABELS = {
 }
 
 FONT = "/System/Library/Fonts/Hiragino Sans GB.ttc"
+NUMBER_FONT = "/System/Library/Fonts/Supplemental/DIN Alternate Bold.ttf"
 DARK = "#100d18"
-YELLOW = "#ffe35a"
+COVER_WIDTH = 1280
+COVER_HEIGHT = 800
 
 
 def clean_text(text):
@@ -57,24 +61,31 @@ def text_width(text):
     return sum(1 if east_asian_width(char) in ("F", "W") else 0.60 for char in text)
 
 
-def heading_lines(heading):
-    if text_width(heading) <= 11:
-        return [heading]
-    midpoint = len(heading) // 2
-    boundary = min((i for i, char in enumerate(heading) if char == " "),
-                   key=lambda i: abs(i - midpoint), default=midpoint)
-    if abs(boundary - midpoint) > len(heading) // 4:
-        boundary = midpoint
-    return [heading[:boundary].rstrip(), heading[boundary:].lstrip()]
+def cover_line(sequence, heading):
+    heading = clean_text(heading) or "游戏实况"
+    number = f"{sequence:03d}"
+    prefix_width = len(number) * 0.49 + 0.33
+    line_width = 1030
+    minimum = 94
+    available = line_width / minimum - prefix_width
+    if text_width(heading) > available:
+        label = ""
+        for char in heading:
+            if text_width(label + char + "…") > available:
+                break
+            label += char
+        heading = label.rstrip() + "…"
+    size = min(144, round(line_width / (prefix_width + text_width(heading))))
+    return number, heading, size, round(prefix_width * size)
 
 
-def outline_text(text, color, size, position):
-    return ["-pointsize", str(size), "-fill", color, "-stroke", DARK, "-strokewidth", "14",
+def outline_text(text, font, color, size, position):
+    return ["-font", font, "-pointsize", str(size), "-fill", color, "-stroke", DARK, "-strokewidth", "10",
             "-annotate", position, text,
-            "-stroke", color, "-strokewidth", "5", "-annotate", position, text]
+            "-stroke", color, "-strokewidth", "4", "-annotate", position, text]
 
 
-def render_cover(video, output, sequence, heading, action, *, at=None):
+def render_cover(video, output, sequence, heading, *, at=None):
     if at is None:
         duration = subprocess.check_output(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video],
@@ -83,30 +94,26 @@ def render_cover(video, output, sequence, heading, action, *, at=None):
         at = float(duration.strip()) * 0.36
     frame = subprocess.check_output(
         ["ffmpeg", "-nostdin", "-v", "error", "-ss", str(at), "-i", video, "-frames:v", "1",
-         "-vf", "scale=1280:800:force_original_aspect_ratio=increase,crop=1280:800",
+         "-vf", "scale=w='min(1920,iw)':h=-2",
          "-f", "image2pipe", "-c:v", "mjpeg", "-threads", "1", "-"],
         timeout=60,
     )
-    badge = f"第{sequence:03d}集"
-    badge_size = min(110, round(520 / text_width(badge)))
-    badge_right = 184 + round(badge_size * text_width(badge))
-    lines = heading_lines(heading)
-    title_size = min(164 if len(lines) == 1 else 124,
-                     round(1040 / max(max(map(text_width, lines)), 1)))
-    text = []
-    for index, line in enumerate(lines):
-        y = (315 if len(lines) == 1 else 267) + index * (title_size + 13)
-        text.extend(outline_text(f" {line}", "#ffffff", title_size, f"+117+{y}"))
-    if action:
-        action_size = min(93, round(1020 / text_width(action)))
-        text.extend(outline_text(f" {action}", "#fff29a", action_size, "+117+545"))
+    render_cover_frame(frame, output, sequence, heading)
+
+
+def render_cover_frame(frame, output, sequence, heading):
+    number, label, size, offset = cover_line(sequence, heading)
+    canvas = f"{COVER_WIDTH}x{COVER_HEIGHT}"
+    x, baseline = 116, 630
     subprocess.run(
-        ["magick", "jpeg:-", "-colorspace", "sRGB", "-modulate", "108,114,100",
-         "(", "-size", "800x1280", "gradient:#100d18de-#100d1800", "-rotate", "-90", ")",
+        ["magick", "jpeg:-", "-colorspace", "sRGB", "-resize", f"{canvas}^",
+         "-gravity", "Center", "-extent", canvas, "-modulate", "106,110,100",
+         "(", "-size", f"{COVER_WIDTH}x520", "gradient:#100d1800-#100d18ed",
+         "-gravity", "South", "-background", "none", "-extent", canvas, ")",
          "-compose", "Over", "-composite",
-         "-fill", YELLOW, "-stroke", "none", "-draw", f"roundrectangle 115,111 {badge_right},250 21,21",
-         "-font", FONT, "-gravity", "NorthWest", "-pointsize", str(badge_size),
-         "-fill", DARK, "-stroke", DARK, "-strokewidth", "4.8", "-annotate", "+135+122", badge,
-         *text, "-sampling-factor", "4:4:4", "-quality", "91", "-strip", f"jpg:{output}"],
+         "-gravity", "Forget",
+         *outline_text(number, NUMBER_FONT, "#f6d89a", size, f"+{x}+{baseline}"),
+         *outline_text(label, FONT, "#ffffff", size, f"+{x+offset}+{baseline}"),
+         "-sampling-factor", "4:4:4", "-quality", "91", "-strip", f"jpg:{output}"],
         input=frame, check=True, capture_output=True, timeout=60,
     )

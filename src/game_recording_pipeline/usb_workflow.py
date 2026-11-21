@@ -207,7 +207,7 @@ class Workflow:
         receipt = uploads.get("bilibili", {})
         publication = entry.get("publication", {})
         rejected_bvid = entry.get("rejected_bilibili", {}).get("bvid")
-        default_title, heading, action = recording_text(entry)
+        default_title, heading, _ = recording_text(entry)
         title = receipt.get("title") or publication.get("title") or default_title
         bvid = receipt.get("bvid") or self.bilibili.find(title, exclude=rejected_bvid)
         if bvid:
@@ -234,7 +234,7 @@ class Workflow:
         with tempfile.TemporaryDirectory(prefix="submission-", dir=self.work) as temporary:
             submission = video
             cover = Path(temporary) / "封面.jpg"
-            render_cover(video, cover, sequence, heading, action)
+            render_cover(video, cover, sequence, heading)
             if repaired:
                 submission = Path(temporary) / f"{video.stem}.mp4"
                 self.bilibili.transcode(video, submission)
