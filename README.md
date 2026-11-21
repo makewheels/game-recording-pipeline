@@ -30,7 +30,7 @@ uv run --no-project python recording_catalog.py --catalog '/视频目录/视频�
 
 ## 插入 U 盘后自动归档
 
-安装 FFmpeg、Xcode 命令行工具，以及已登录的 `biliup` 和 `bdpan`。把 `workflow.example.json` 复制为 `workflow.local.json`，填写录屏目录、U 盘的卷 UUID、网盘目录和投稿设置。卷 UUID 可以通过 `diskutil info /Volumes/卷名` 查看。
+安装 FFmpeg、ImageMagick、Xcode 命令行工具，以及已登录的 `biliup` 和 `bdpan`。把 `workflow.example.json` 复制为 `workflow.local.json`，填写录屏目录、U 盘的卷 UUID、网盘目录和投稿设置。卷 UUID 可以通过 `diskutil info /Volumes/卷名` 查看。
 
 ```sh
 uv run --no-project python -B usb_workflow.py --config workflow.local.json --scan
@@ -38,6 +38,8 @@ uv run --no-project python -B usb_workflow.py --config workflow.local.json --onc
 ```
 
 `--scan` 只列出候选录屏。`--once` 运行一轮导入和上传。程序从文件名读取录制时间，用 Apple Vision 识别画面里的任务提示。已知任务会用任务名命名，其他片段会尝试用画面中的目标文字命名。
+
+B 站标题由集数、中文任务名、英文原名和本段内容组成。封面用录屏画面作背景，叠加集数和任务文字。
 
 确认目录、账号和导入结果后，可在配置里将 `delete_after_verification` 改为 `true`。弹出 U 盘后安装后台任务。
 

@@ -126,9 +126,9 @@ class Bilibili:
             return "rejected", reason
         return "reviewing", reason
 
-    def submit(self, video, title, description):
+    def submit(self, video, title, description, *, cover):
         arguments = [*self.prefix, "upload", "--submit", "web", "--tid", str(self.partition),
-                     "--tag", self.tags, "--title", title, "--desc", description]
+                     "--tag", self.tags, "--title", title, "--desc", description, "--cover", str(cover)]
         if self.line:
             arguments.extend(["--line", self.line])
         result = execute([*arguments, "--", str(video)], self.work)

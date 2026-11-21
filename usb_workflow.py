@@ -19,6 +19,7 @@ import uuid
 
 from classify_recording import FrameClassifier
 from delivery_clients import Baidu, Bilibili, DeliveryError, TECHNICAL_REJECTION
+from publication_assets import clean_text, recording_text, render_cover
 from recording_catalog import append_recording, catalog_lock, read_catalog, sha256, write_catalog
 
 
@@ -199,14 +200,12 @@ class Workflow:
         uploads = entry.get("uploads", {})
         receipt = uploads.get("bilibili", {})
         publication = entry.get("publication", {})
-        title = receipt.get("title") or publication.get("title")
-        if not title:
-            clip = Path(entry["filename"]).stem.split("_", 2)[2].replace("_", "｜")
-            title = f"第{sequence:03d}集｜{clip}"[:80]
+        default_title, heading, action = recording_text(entry)
+        title = receipt.get("title") or publication.get("title") or default_title
         bvid = receipt.get("bvid") or self.bilibili.find(title)
         if bvid:
             status, reason = self.bilibili.review(bvid)
-            receipt = {"bvid": bvid, "title": title, "status": status}
+            receipt = receipt | {"bvid": bvid, "title": title, "status": status}
             self.change(sequence, uploads=uploads | {"bilibili": receipt}, bilibili_error=reason)
             if (
                 status != "rejected" or publication.get("repaired")
@@ -214,7 +213,7 @@ class Workflow:
                 or any(word in reason for word in ("版权", "违规", "血腥", "隐私"))
             ):
                 return
-            retry_title = title[:72] + "（重传）"
+            retry_title = clean_text(title)[:72] + "（重传）"
             self.change(sequence, publication={"title": retry_title, "repaired": True, "started": False},
                         uploads={key: value for key, value in uploads.items() if key != "bilibili"},
                         rejected_bilibili=receipt | {"reason": reason})
@@ -222,17 +221,20 @@ class Workflow:
 
         if publication.get("started"):
             return
+        title = clean_text(title)
         video = checked_local(self.video_directory(entry), entry)
         repaired = publication.get("repaired", False)
         state = {"title": title, "repaired": repaired, "started": True}
         with tempfile.TemporaryDirectory(prefix="submission-", dir=self.work) as temporary:
             submission = video
+            cover = Path(temporary) / "封面.jpg"
+            render_cover(video, cover, sequence, heading, action)
             if repaired:
                 submission = Path(temporary) / "录屏.mp4"
                 self.bilibili.transcode(video, submission)
             self.change(sequence, publication=state)
             try:
-                bvid = self.bilibili.submit(submission, title, f"{title}。游戏实况录屏。")
+                bvid = self.bilibili.submit(submission, title, f"{title}。游戏实况录屏。", cover=cover)
             except DeliveryError as error:
                 if "文件传输失败，可重试" in str(error):
                     self.change(sequence, publication=state | {"started": False})
