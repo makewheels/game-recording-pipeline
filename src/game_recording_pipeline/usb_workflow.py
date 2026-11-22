@@ -19,7 +19,7 @@ import uuid
 
 from .classify_recording import FrameClassifier
 from .delivery_clients import Baidu, Bilibili, BilibiliCollection, DeliveryError, TECHNICAL_REJECTION
-from .publication_assets import COVER_DIRECTORY, clean_text, recording_text, render_cover
+from .publication_assets import COVER_DIRECTORY, clean_text, recording_cover_title, recording_text, render_cover
 from .recording_catalog import append_recording, catalog_lock, read_catalog, rename_without_replacing, sha256, write_catalog
 
 
@@ -206,13 +206,14 @@ class Workflow:
         if not cover.exists():
             if video is None:
                 video = checked_local(self.video_directory(entry), entry)
-            _, heading, _ = recording_text(entry)
+            heading = recording_cover_title(entry)
             with tempfile.TemporaryDirectory(prefix="cover-", dir=self.work) as temporary:
                 staging = Path(temporary) / "封面.jpg"
                 render_cover(video, staging, entry["sequence"], heading,
                              at=publication.get("cover_frame_seconds"))
                 cover.parent.mkdir(exist_ok=True)
                 rename_without_replacing(staging, cover)
+            publication = publication | {"cover_title": heading}
         checksum = sha256(cover)
         if publication.get("cover_sha256", checksum) != checksum:
             raise DeliveryError(f"本地封面 SHA-256 不一致 {cover.name}")

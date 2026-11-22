@@ -9,10 +9,11 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 
-from .publication_assets import recording_stem
+from .publication_assets import recording_stem, render_catalog_cover
 
 
 @contextmanager
@@ -173,6 +174,25 @@ def record_upload(path, args):
     print(f'{entry["sequence"]:03d}  已登记 {service}')
 
 
+def generate_covers(path, args):
+    entries = [e for e in read_catalog(path)["videos"] if args.sequence in (None, e["sequence"])]
+    if not entries:
+        raise ValueError("清单里没有匹配的录屏")
+    output = args.output_dir.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    plan = []
+    for entry in entries:
+        default = Path(entry["filename"]).with_suffix(".jpg")
+        file = output / Path(entry.get("publication", {}).get("cover_file", default)).name
+        if file.exists() or file.is_symlink() or file.suffix.lower() != ".jpg" or any(file == p[1] for p in plan):
+            raise ValueError(f"封面输出路径有冲突 {file}")
+        plan.append((entry, file))
+    for entry, file in plan:
+        directory = Path(entry["local_directory"]) if "local_directory" in entry else path.parent
+        render_catalog_cover(entry, directory, file)
+        print(f'{entry["sequence"]:03d}  {file.name}', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="用序号和 SHA-256 管理录屏")
     parser.add_argument("--catalog", type=Path, default=Path("视频列表.json"))
@@ -187,6 +207,10 @@ def main():
     verify = commands.add_parser("verify", help="核对本地文件和 SHA-256")
     verify.add_argument("--sequence", type=int, help="仅核对指定总序号")
 
+    covers = commands.add_parser("covers", help="从视频清单生成封面")
+    covers.add_argument("--sequence", type=int, help="仅生成指定总序号的封面")
+    covers.add_argument("--output-dir", type=Path, required=True, help="封面输出目录")
+
     record = commands.add_parser("record-upload", help="登记已确认的上传结果")
     record.add_argument("sequence", type=int)
     service = record.add_mutually_exclusive_group(required=True)
@@ -197,14 +221,16 @@ def main():
     args = parser.parse_args()
     path = args.catalog.resolve()
     try:
-        with catalog_lock(path, write=args.command != "verify"):
+        with catalog_lock(path, write=args.command in ("add", "record-upload")):
             if args.command == "add":
                 add_recording(path, args)
             elif args.command == "verify":
                 return verify_recordings(path, args)
+            elif args.command == "covers":
+                generate_covers(path, args)
             else:
                 record_upload(path, args)
-    except (KeyError, OSError, TypeError, ValueError) as exc:
+    except (KeyError, OSError, TypeError, ValueError, subprocess.SubprocessError) as exc:
         print(f"错误 {exc}", file=sys.stderr)
         return 1
     return 0
