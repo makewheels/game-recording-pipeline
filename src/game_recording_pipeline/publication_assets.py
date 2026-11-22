@@ -73,7 +73,7 @@ def cover_heading(heading):
                 break
             label += char
         heading = label.rstrip() + "…"
-    return heading, min(156, round(line_width / text_width(heading)))
+    return heading, min(146, round(line_width / text_width(heading)))
 
 
 def outline_text(text, font, color, size, position):
@@ -108,8 +108,8 @@ def render_cover_frame(frame, output, sequence, heading):
          "-gravity", "South", "-background", "none", "-extent", canvas, ")",
          "-compose", "Over", "-composite",
          "-gravity", "Forget",
-         *outline_text(f"{sequence:03d}", NUMBER_FONT, "#f6d89a", 174, "+140+482"),
-         *outline_text(label, FONT, "#ffffff", size, "+140+650"),
+         *outline_text(f"{sequence:03d}", NUMBER_FONT, "#f6d89a", 198, "+140+434"),
+         *outline_text(label, FONT, "#ffffff", size, "+140+602"),
          "-sampling-factor", "4:4:4", "-quality", "91", "-strip", f"jpg:{output}"],
         input=frame, check=True, capture_output=True, timeout=60,
     )
