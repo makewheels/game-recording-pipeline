@@ -27,6 +27,8 @@ FORMATS = {".webm", ".mp4", ".mkv", ".mov", ".m4v"}
 DISKUTIL = "/usr/sbin/diskutil"
 LAUNCHCTL = "/bin/launchctl"
 AGENT_NAME = "local.game-recording-pipeline.usb"
+POLL_SECONDS = 120
+WORKFLOW_ERRORS = (OSError, DeliveryError, subprocess.SubprocessError, ValueError)
 
 
 def attached_disk(volume_uuid):
@@ -93,6 +95,19 @@ def remove_verified(path, checksum, still_allowed=None):
 
 def backup_verified(receipt):
     return bool(receipt.get("verified_md5") or receipt.get("verified_sha256"))
+
+
+def needs_review(receipt):
+    return receipt.get("status") == "rejected" or receipt.get("audit", {}).get("traffic_limited") is True
+
+
+def review_signature(receipt, reason):
+    if not needs_review(receipt):
+        return None
+    audit = receipt.get("audit", {})
+    problems = [(item.get("reject_reason_id"), item.get("reject_reason"), item.get("violation_time"))
+                for item in audit.get("problem_detail", [])]
+    return receipt.get("bvid"), receipt["status"], audit.get("traffic_limited", False), reason, problems
 
 
 class Workflow:
@@ -186,13 +201,16 @@ class Workflow:
                                          title, extra, self.directory)
                 print(f'已导入 {entry["sequence"]:03d} {entry["filename"]}', flush=True)
 
-    def active(self):
+    def entries(self):
         with catalog_lock(self.path, write=False):
-            return [
-                item for item in self.load()["videos"]
-                if item.get("usb", {}).get("volume_uuid") == self.volume_uuid
-                and not item.get("cleanup", {}).get("completed")
-            ]
+            return self.load()["videos"]
+
+    def active(self):
+        return [
+            item for item in self.entries()
+            if item.get("usb", {}).get("volume_uuid") == self.volume_uuid
+            and not item.get("cleanup", {}).get("completed")
+        ]
 
     def cover_asset(self, entry, video=None):
         publication = entry.get("publication", {})
@@ -235,7 +253,142 @@ class Workflow:
         })
         self.change(sequence, publication=publication, uploads=uploads | {"baidu_cover": receipt}, baidu_error="")
 
+    def refresh_audit(self, sequence, receipt):
+        bvid = receipt["bvid"]
+        status, reason = self.bilibili.review(bvid)
+        audit = self.bilibili.audit_details(bvid)
+        with catalog_lock(self.path, write=True):
+            catalog = self.load()
+            entry = next(item for item in catalog["videos"] if item["sequence"] == sequence)
+            uploads = entry.setdefault("uploads", {})
+            current = uploads.get("bilibili", {})
+            if current.get("bvid", bvid) != bvid:
+                raise DeliveryError("清单中的 BV 号已变化")
+            updated = receipt | current | {"status": status, "audit": audit}
+            updated["review_reason"] = reason
+            previous = review_signature(current, current.get("review_reason", entry.get("bilibili_error", "")))
+            if updated != current or entry.get("bilibili_error") != reason:
+                uploads["bilibili"] = updated
+                entry["bilibili_error"] = reason
+                write_catalog(self.path, catalog)
+        issue = review_signature(updated, reason)
+        if issue is not None and issue != previous:
+            print(json.dumps({"event": "bilibili_audit_issue", "sequence": sequence, "bvid": bvid,
+                              "status": status, "traffic_limited": audit["traffic_limited"]},
+                             ensure_ascii=False), file=sys.stderr, flush=True)
+        return updated, reason
+
+    def audit_queue(self, entries):
+        result = {"issues": [], "errors": []}
+        for entry in entries:
+            receipt = entry.get("uploads", {}).get("bilibili", {})
+            if not receipt.get("bvid"):
+                continue
+            identity = {"sequence": entry["sequence"], "bvid": receipt["bvid"]}
+            try:
+                updated, reason = self.refresh_audit(entry["sequence"], receipt)
+            except WORKFLOW_ERRORS as exc:
+                result["errors"].append(identity | {"error": str(exc)})
+                continue
+            if needs_review(updated):
+                directory = Path(entry.get("local_directory", self.path.parent))
+                result["issues"].append(identity | {
+                    "title": updated.get("title"),
+                    "status": updated["status"],
+                    "reason": reason,
+                    "audit": updated["audit"],
+                    "original_path": str(directory / entry["filename"]),
+                    "original_sha256": entry["sha256"],
+                    "baidu_path": entry["uploads"].get("baidu", {}).get("path"),
+                    "bilibili_copy": entry.get("publication", {}).get("bilibili_copy"),
+                })
+        return result
+
+    def recording(self, sequence):
+        entry = next((item for item in self.entries() if item["sequence"] == sequence), None)
+        if entry is None:
+            raise DeliveryError(f"清单里没有序号 {sequence}")
+        return entry
+
+    def stage_bilibili_copy(self, sequence, video):
+        entry = self.recording(sequence)
+        publication = entry.get("publication", {})
+        receipt = entry.get("uploads", {}).get("bilibili", {})
+        if publication.get("bilibili_copy") or (publication.get("started") and not receipt.get("bvid")):
+            raise DeliveryError("已有待处理的 B 站投稿")
+        source = self.video_directory(entry) / entry["filename"]
+        video = video.expanduser().absolute()
+        if video.is_symlink() or not video.is_file() or video.suffix.lower() not in FORMATS:
+            raise DeliveryError("需要独立保存的 B 站视频副本")
+        video = video.resolve()
+        checksum = sha256(video)
+        if (video == source.resolve() or (source.exists() and video.samefile(source))
+                or checksum == entry["sha256"]):
+            raise DeliveryError("B 站处理版必须与原片独立保存，且内容已修改")
+        title = receipt.get("title") or publication.get("title") or recording_text(entry)[0]
+        if receipt.get("bvid"):
+            current, _ = self.refresh_audit(sequence, receipt)
+            if not needs_review(current):
+                raise DeliveryError("当前 B 站稿件没有退回或限流问题")
+            if checksum == current.get("video_sha256"):
+                raise DeliveryError("处理版与当前 B 站稿件的视频相同")
+            title = re.sub(r"【修订版 \d+】$", "", title)
+            title += f"【修订版 {len(entry.get('bilibili_history', [])) + 1}】"
+        copy = {"path": str(video), "sha256": checksum, "title": clean_text(title),
+                "supersedes": receipt.get("bvid"), "started": False}
+        self.change(sequence, publication=publication | {"bilibili_copy": copy})
+        return copy
+
+    def submit_bilibili_copy(self, entry):
+        sequence = entry["sequence"]
+        uploads = entry.get("uploads", {})
+        previous = uploads.get("bilibili", {})
+        publication = entry.get("publication", {})
+        copy = publication.get("bilibili_copy")
+        if not copy:
+            raise DeliveryError(f"序号 {sequence} 尚未登记 B 站处理版")
+        title = copy["title"]
+        old_bvid = copy["supersedes"]
+        if previous.get("bvid") != old_bvid:
+            raise DeliveryError("待处理稿件的 BV 号已变化")
+        if copy["started"]:
+            bvid = self.bilibili.find(title, exclude=old_bvid)
+            if not bvid:
+                raise DeliveryError("B 站处理版投稿结果待核对")
+        else:
+            if old_bvid:
+                previous, _ = self.refresh_audit(sequence, previous)
+                if not needs_review(previous):
+                    raise DeliveryError("当前 B 站稿件没有退回或限流问题")
+            if self.bilibili.find(title, exclude=old_bvid):
+                raise DeliveryError("已有同名 B 站稿件，请先核对")
+            video = Path(copy["path"])
+            if video.is_symlink() or not video.is_file() or sha256(video) != copy["sha256"]:
+                raise DeliveryError("B 站处理版缺失或 SHA-256 不一致")
+            cover, publication = self.cover_asset(entry)
+            self.change(sequence, publication=publication | {"bilibili_copy": copy | {"started": True}})
+            try:
+                bvid = self.bilibili.submit(video, title, f"{title}。游戏实况录屏。",
+                                             cover=cover, exclude=old_bvid)
+            except DeliveryError as exc:
+                if "文件传输失败，可重试" in str(exc):
+                    self.change(sequence, publication=publication)
+                raise
+            if not bvid:
+                raise DeliveryError("B 站处理版投稿结果待核对")
+        receipt = {"bvid": bvid, "title": title, "status": "reviewing", "video_sha256": copy["sha256"]}
+        history = entry.get("bilibili_history", [])
+        if old_bvid:
+            history = [*history, previous]
+        publication = {key: value for key, value in publication.items() if key != "bilibili_copy"}
+        self.change(sequence, publication=publication | {"title": title, "started": True},
+                    uploads=uploads | {"bilibili": receipt}, bilibili_history=history, bilibili_error="")
+        return receipt
+
     def publish_one(self, entry):
+        if entry.get("publication", {}).get("bilibili_copy"):
+            self.submit_bilibili_copy(entry)
+            return
         sequence = entry["sequence"]
         uploads = entry.get("uploads", {})
         receipt = uploads.get("bilibili", {})
@@ -245,11 +398,10 @@ class Workflow:
         title = receipt.get("title") or publication.get("title") or default_title
         bvid = receipt.get("bvid") or self.bilibili.find(title, exclude=rejected_bvid)
         if bvid:
-            status, reason = self.bilibili.review(bvid)
-            receipt = receipt | {"bvid": bvid, "title": title, "status": status}
-            self.change(sequence, uploads=uploads | {"bilibili": receipt}, bilibili_error=reason)
+            receipt, reason = self.refresh_audit(sequence, receipt | {"bvid": bvid, "title": title})
             if (
-                status != "rejected" or publication.get("repaired")
+                receipt["status"] != "rejected" or receipt["audit"]["traffic_limited"]
+                or publication.get("repaired") or receipt.get("video_sha256")
                 or not TECHNICAL_REJECTION.search(reason)
                 or any(word in reason for word in ("版权", "违规", "血腥", "隐私"))
             ):
@@ -297,6 +449,11 @@ class Workflow:
                 continue
             if receipt.get("status") != "published" or not receipt.get("bvid"):
                 break
+            # 修订版与已经入合集的旧稿件需要在创作中心交换位置。
+            if any((old.get("collection_id"), old.get("section_id")) == (
+                self.collection.collection_id, self.collection.section_id
+            ) for old in entry.get("bilibili_history", [])):
+                continue
             pending[entry["sequence"]] = receipt["bvid"]
         results = self.collection.ensure(list(pending.values()))
         if not results:
@@ -315,16 +472,28 @@ class Workflow:
 
     def drain(self):
         succeeded = True
-        for service, method in (("bilibili", self.publish_one), ("baidu", self.backup_one)):
-            for entry in self.active():
+        active = self.active()
+        active_sequences = {entry["sequence"] for entry in active}
+        other = [entry for entry in self.entries() if entry["sequence"] not in active_sequences]
+        staged = [entry for entry in other if entry.get("publication", {}).get("bilibili_copy")]
+        manual = [entry for entry in other if not entry.get("publication", {}).get("bilibili_copy")]
+        for error in self.audit_queue(manual)["errors"]:
+            print(json.dumps(error, ensure_ascii=False), file=sys.stderr, flush=True)
+            succeeded = False
+        # 优先核对已有 BV 号，再开始可能耗时的上传。
+        active.sort(key=lambda entry: not entry.get("uploads", {}).get("bilibili", {}).get("bvid"))
+        for service, method, entries in (
+            ("bilibili", self.publish_one, active + staged),
+            ("baidu", self.backup_one, self.active()),
+        ):
+            for entry in entries:
                 try:
                     method(entry)
-                except (OSError, DeliveryError, subprocess.SubprocessError) as exc:
+                except WORKFLOW_ERRORS as exc:
                     message = str(exc) if isinstance(exc, DeliveryError) else type(exc).__name__
                     self.change(entry["sequence"], **{f"{service}_error": message})
                     print(f'{entry["sequence"]:03d} {service} {message}', flush=True)
                     succeeded = False
-                    break
         self.sync_collection(self.active())
         return succeeded
 
@@ -336,13 +505,15 @@ class Workflow:
             archive = entry.get("uploads", {}).get("bilibili", {})
             backup = entry.get("uploads", {}).get("baidu", {})
             cover = entry.get("uploads", {}).get("baidu_cover", {})
-            if archive.get("status") != "published" or not backup_verified(backup) or not backup_verified(cover):
+            if (entry.get("publication", {}).get("bilibili_copy") or archive.get("status") != "published"
+                    or not backup_verified(backup) or not backup_verified(cover)):
                 return
             if self.collection and (archive.get("collection_id"), archive.get("section_id")) != (
                 self.collection.collection_id, self.collection.section_id
             ):
                 return
-            if self.bilibili.review(archive["bvid"])[0] != "published":
+            receipt, _ = self.refresh_audit(entry["sequence"], archive)
+            if receipt["status"] != "published" or receipt["audit"]["traffic_limited"]:
                 return
             if not self.baidu.confirmed(entry["filename"], backup):
                 return
@@ -428,13 +599,18 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--scan", action="store_true", help="只列出 U 盘上的候选录屏")
     mode.add_argument("--once", action="store_true", help="运行一轮导入、上传与核对")
+    mode.add_argument("--audit", type=int, metavar="序号", help="仅刷新指定稿件的审核详情")
+    mode.add_argument("--audit-queue", action="store_true", help="刷新已登记稿件并输出待处理审核问题 JSON")
+    mode.add_argument("--stage-bilibili-copy", type=int, metavar="序号", help="登记下一轮仅用于 B 站投稿的处理版")
+    mode.add_argument("--submit-bilibili-copy", type=int, metavar="序号", help="只提交指定序号已登记的 B 站处理版")
+    parser.add_argument("--video", type=Path, help="与 --stage-bilibili-copy 一起使用的处理版视频")
     mode.add_argument("--watch", action="store_true", help="持续等待 U 盘和审核结果")
     mode.add_argument("--install", action="store_true", help="在下一次插入 U 盘前安装后台任务")
     args = parser.parse_args()
+    if (args.stage_bilibili_copy is None) != (args.video is None):
+        parser.error("--stage-bilibili-copy 和 --video 必须一起使用")
     config_path = args.config.expanduser().resolve()
     with config_path.open(encoding="utf-8") as config_file:
-        if not (args.scan or args.install):
-            fcntl.flock(config_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         config = json.load(config_file)
         with tempfile.TemporaryDirectory(prefix="recording-workflow-") as temporary:
             workflow = Workflow(config, Path(temporary))
@@ -446,20 +622,47 @@ def main():
                 return
             if not workflow.path.parent.is_dir():
                 raise ValueError(f"请先创建录屏目录 {workflow.path.parent}")
+            if args.audit_queue or any(sequence is not None for sequence in
+                                       (args.audit, args.stage_bilibili_copy, args.submit_bilibili_copy)):
+                fcntl.flock(config_file, fcntl.LOCK_EX)
+                try:
+                    if args.audit_queue:
+                        result = workflow.audit_queue(workflow.entries())
+                    elif args.stage_bilibili_copy is not None:
+                        result = workflow.stage_bilibili_copy(args.stage_bilibili_copy, args.video)
+                    elif args.submit_bilibili_copy is not None:
+                        result = workflow.submit_bilibili_copy(workflow.recording(args.submit_bilibili_copy))
+                    else:
+                        entry = workflow.recording(args.audit)
+                        receipt = entry.get("uploads", {}).get("bilibili", {})
+                        if not receipt.get("bvid"):
+                            raise DeliveryError(f"序号 {args.audit} 没有登记 B 站 BV 号")
+                        updated, _ = workflow.refresh_audit(args.audit, receipt)
+                        result = updated["audit"]
+                except WORKFLOW_ERRORS as exc:
+                    parser.exit(1, f"{exc}\n")
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                if args.audit_queue and result["errors"]:
+                    sys.exit(1)
+                return
             workflow.directory.mkdir(parents=True, exist_ok=True)
             if args.install:
                 install_agent(config_path, workflow)
                 return
             while True:
                 try:
-                    succeeded = workflow.cycle()
-                except (OSError, DeliveryError, subprocess.SubprocessError, ValueError) as exc:
+                    fcntl.flock(config_file, fcntl.LOCK_EX)
+                    try:
+                        succeeded = workflow.cycle()
+                    finally:
+                        fcntl.flock(config_file, fcntl.LOCK_UN)
+                except WORKFLOW_ERRORS as exc:
                     print(str(exc), file=sys.stderr, flush=True)
                     if args.once:
                         sys.exit(1)
                 if args.once:
                     sys.exit(0 if succeeded else 1)
-                time.sleep(120)
+                time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":

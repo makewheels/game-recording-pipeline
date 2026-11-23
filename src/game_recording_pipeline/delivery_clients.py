@@ -93,6 +93,8 @@ class Baidu:
         return bool(receipt.get("verified_sha256") and self.identity(item) == receipt.get("remote_identity"))
 
 
+BILIBILI_USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 BV_PATTERN = re.compile(r"BV[A-Za-z0-9]{10}\b")
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 TECHNICAL_REJECTION = re.compile(r"转码失败|视频编码不支持|音频编码不支持|封装格式不支持|分辨率不符合")
@@ -101,6 +103,7 @@ TECHNICAL_REJECTION = re.compile(r"转码失败|视频编码不支持|音频编�
 class Bilibili:
     def __init__(self, work, cookies, partition, tags, line):
         self.work = work
+        self.cookies = cookies
         self.prefix = ["biliup", "-u", str(cookies)]
         self.partition = partition
         self.tags = tags
@@ -131,6 +134,46 @@ class Bilibili:
         if state == -2 or any(word in reason for word in ("审核不通过", "退回", "打回")):
             return "rejected", reason
         return "reviewing", reason
+
+    def audit_details(self, bvid):
+        if not BV_PATTERN.fullmatch(bvid):
+            raise ValueError("无效的哔哩哔哩 BV 号")
+        try:
+            info = json.loads(self.cookies.read_text(encoding="utf-8"))
+            cookies = {item["name"]: item["value"] for item in info["cookie_info"]["cookies"]}
+            session = cookies["SESSDATA"]
+            if not session:
+                raise ValueError("缺少登录会话")
+        except (OSError, TypeError, ValueError, KeyError):
+            raise DeliveryError("查询哔哩哔哩审核详情需要有效的 biliup 登录信息") from None
+
+        origin = "https://member.bilibili.com"
+        query = urlencode({"bvid": bvid})
+        request = Request(f"{origin}/x/web/detail/audit?{query}", headers={
+            "Cookie": f"SESSDATA={session}",
+            "Referer": f"{origin}/platform/upload-manager/archive-process?{query}",
+            "User-Agent": BILIBILI_USER_AGENT,
+        })
+        try:
+            with urlopen(request, timeout=20) as response:
+                result = json.load(response)
+        except (OSError, ValueError) as exc:
+            status = getattr(exc, "code", None) or type(exc).__name__
+            raise DeliveryError(f"哔哩哔哩审核详情查询失败 {bvid} {status}") from None
+
+        data = result.get("data") if isinstance(result, dict) and result.get("code") == 0 else None
+        if not isinstance(data, dict) or data.get("is_owner") is not True or type(data.get("aegis_state")) is not int:
+            raise DeliveryError(f"哔哩哔哩未返回可核对的审核详情 {bvid}")
+        problems = data.get("problem_detail")
+        if problems is not None and (
+            not isinstance(problems, list) or any(not isinstance(item, dict) for item in problems)
+        ):
+            raise DeliveryError(f"哔哩哔哩返回的审核问题格式无效 {bvid}")
+        return {
+            "aegis_state": data["aegis_state"],
+            "traffic_limited": data["aegis_state"] == 5,
+            "problem_detail": problems or [],
+        }
 
     def submit(self, video, title, description, *, cover, exclude=None):
         arguments = [*self.prefix, "upload", "--submit", "web", "--tid", str(self.partition),
@@ -167,8 +210,6 @@ class Bilibili:
 class BilibiliCollection:
     MEMBER = "https://member.bilibili.com"
     PUBLIC = "https://api.bilibili.com"
-    USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
     def __init__(self, cookies, collection_id, section_id):
         if any(type(value) is not int or value <= 0 for value in (collection_id, section_id)):
@@ -191,7 +232,7 @@ class BilibiliCollection:
         return headers, csrf, owner
 
     def request(self, origin, route, query, headers, payload=None):
-        headers = {"User-Agent": self.USER_AGENT} | headers
+        headers = {"User-Agent": BILIBILI_USER_AGENT} | headers
         body = None
         if payload is not None:
             headers["Content-Type"] = "application/json"
